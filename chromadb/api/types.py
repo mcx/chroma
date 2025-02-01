@@ -1,56 +1,444 @@
-from typing import Any, Optional, Union, Dict, Sequence, TypeVar, List
-from typing_extensions import Literal, TypedDict, Protocol
+from typing import Optional, Set, Union, TypeVar, List, Dict, Any, Tuple, cast
+from numpy.typing import NDArray
+import numpy as np
+from typing_extensions import TypedDict, Protocol, runtime_checkable
+from enum import Enum
+from pydantic import Field
 import chromadb.errors as errors
+from chromadb.types import (
+    Metadata,
+    UpdateMetadata,
+    Vector,
+    PyVector,
+    LiteralValue,
+    LogicalOperator,
+    WhereOperator,
+    OperatorExpression,
+    Where,
+    WhereDocumentOperator,
+    WhereDocument,
+)
+from inspect import signature
+from tenacity import retry
 
-ID = str
-IDs = List[ID]
-
-Number = Union[int, float]
-Embedding = List[Number]
-Embeddings = List[Embedding]
-
-
-Metadata = Dict[str, Union[str, int, float]]
-Metadatas = List[Metadata]
-
-CollectionMetadata = Dict[Any, Any]
-
-Document = str
-Documents = List[Document]
-
-Parameter = TypeVar("Parameter", Embedding, Document, Metadata, ID)
+# Re-export types from chromadb.types
+__all__ = ["Metadata", "Where", "WhereDocument", "UpdateCollectionMetadata"]
+META_KEY_CHROMA_DOCUMENT = "chroma:document"
 T = TypeVar("T")
 OneOrMany = Union[T, List[T]]
 
-Include = List[Literal["documents", "embeddings", "metadatas", "distances"]]
 
-# Grammar for where expressions
-LiteralValue = Union[str, int, float]
-LogicalOperator = Literal["$and", "$or"]
-WhereOperator = Literal["$gt", "$gte", "$lt", "$lte", "$ne", "$eq"]
-OperatorExpression = Dict[Union[WhereOperator, LogicalOperator], LiteralValue]
+def maybe_cast_one_to_many(target: Optional[OneOrMany[T]]) -> Optional[List[T]]:
+    if target is None:
+        return None
+    if isinstance(target, list):
+        return target
+    return [target]
 
-Where = Dict[
-    Union[str, LogicalOperator], Union[LiteralValue, OperatorExpression, List["Where"]]
-]
 
-WhereDocumentOperator = Literal["$contains", LogicalOperator]
-WhereDocument = Dict[WhereDocumentOperator, Union[str, List["WhereDocument"]]]
+# URIs
+URI = str
+URIs = List[URI]
+
+# IDs
+ID = str
+IDs = List[ID]
+
+# Embeddings
+PyEmbedding = PyVector
+PyEmbeddings = List[PyEmbedding]
+Embedding = Vector
+Embeddings = List[Embedding]
+
+
+def normalize_embeddings(
+    target: Optional[Union[OneOrMany[Embedding], OneOrMany[PyEmbedding]]]
+) -> Optional[Embeddings]:
+    if target is None:
+        return None
+
+    if len(target) == 0:
+        raise ValueError(
+            f"Expected Embedings to be non-empty list or numpy array, got {target}"
+        )
+
+    if isinstance(target, list):
+        # One PyEmbedding
+        if isinstance(target[0], (int, float)) and not isinstance(target[0], bool):
+            return [np.array(target, dtype=np.float32)]
+        # List of PyEmbeddings
+        if isinstance(target[0], list):
+            if isinstance(target[0][0], (int, float)) and not isinstance(
+                target[0][0], bool
+            ):
+                return [np.array(embedding, dtype=np.float32) for embedding in target]
+        # List of np.ndarrays
+        if isinstance(target[0], np.ndarray):
+            return cast(Embeddings, target)
+
+    elif isinstance(target, np.ndarray):
+        # A single embedding as a numpy array
+        if target.ndim == 1:
+            return cast(Embeddings, [target])
+        # 2-D numpy array (comes out of embedding models)
+        # TODO: Enforce this at the embedding function level
+        if target.ndim == 2:
+            return list(target)
+
+    raise ValueError(
+        f"Expected embeddings to be a list of floats or ints, a list of lists, a numpy array, or a list of numpy arrays, got {target}"
+    )
+
+
+# Metadatas
+Metadatas = List[Metadata]
+
+CollectionMetadata = Dict[str, Any]
+UpdateCollectionMetadata = UpdateMetadata
+
+# Documents
+Document = str
+Documents = List[Document]
+
+
+def is_document(target: Any) -> bool:
+    if not isinstance(target, str):
+        return False
+    return True
+
+
+# Images
+ImageDType = Union[np.uint, np.int64, np.float64]
+Image = NDArray[ImageDType]
+Images = List[Image]
+
+
+def is_image(target: Any) -> bool:
+    if not isinstance(target, np.ndarray):
+        return False
+    if len(target.shape) < 2:
+        return False
+    return True
+
+
+class BaseRecordSet(TypedDict):
+    """
+    The base record set includes 'data' fields which can be embedded, and embeddings.
+    """
+
+    embeddings: Optional[Embeddings]
+    documents: Optional[Documents]
+    images: Optional[Images]
+    uris: Optional[URIs]
+
+
+def get_default_embeddable_record_set_fields() -> Set[str]:
+    """
+    Returns the set of fields that can be embedded on a Record Set.
+    This is a way to avoid hardcoding the fields in multiple places,
+    and keeps them immutable.
+    """
+    return {"documents", "images", "uris"}
+
+
+class InsertRecordSet(BaseRecordSet):
+    """
+    A set of records for inserting.
+    """
+
+    ids: IDs
+    metadatas: Optional[Metadatas]
+
+
+def normalize_base_record_set(
+    embeddings: Optional[Union[OneOrMany[Embedding], OneOrMany[PyEmbedding]]] = None,
+    documents: Optional[OneOrMany[Document]] = None,
+    images: Optional[OneOrMany[Image]] = None,
+    uris: Optional[OneOrMany[URI]] = None,
+) -> BaseRecordSet:
+    """
+    Unpacks and normalizes the fields of a BaseRecordSet.
+    """
+
+    return BaseRecordSet(
+        embeddings=normalize_embeddings(embeddings),
+        documents=maybe_cast_one_to_many(documents),
+        images=maybe_cast_one_to_many(images),
+        uris=maybe_cast_one_to_many(uris),
+    )
+
+
+def normalize_insert_record_set(
+    ids: OneOrMany[ID],
+    embeddings: Optional[
+        Union[
+            OneOrMany[Embedding],
+            OneOrMany[PyEmbedding],
+        ]
+    ],
+    metadatas: Optional[OneOrMany[Metadata]] = None,
+    documents: Optional[OneOrMany[Document]] = None,
+    images: Optional[OneOrMany[Image]] = None,
+    uris: Optional[OneOrMany[URI]] = None,
+) -> InsertRecordSet:
+    """
+    Unpacks and normalizes the fields of an InsertRecordSet.
+    """
+    base_record_set = normalize_base_record_set(
+        embeddings=embeddings, documents=documents, images=images, uris=uris
+    )
+
+    return InsertRecordSet(
+        ids=cast(IDs, maybe_cast_one_to_many(ids)),
+        metadatas=maybe_cast_one_to_many(metadatas),
+        embeddings=base_record_set["embeddings"],
+        documents=base_record_set["documents"],
+        images=base_record_set["images"],
+        uris=base_record_set["uris"],
+    )
+
+
+def validate_base_record_set(record_set: BaseRecordSet) -> None:
+    """
+    Validates the RecordSet, ensuring that all fields are of the right type and length.
+    """
+    _validate_record_set_length_consistency(record_set)
+
+    if record_set["embeddings"] is not None:
+        validate_embeddings(embeddings=record_set["embeddings"])
+    if record_set["documents"] is not None:
+        validate_documents(
+            documents=record_set["documents"],
+            # If embeddings are present, some documents can be None
+            nullable=(record_set["embeddings"] is not None),
+        )
+    if record_set["images"] is not None:
+        validate_images(images=record_set["images"])
+
+    # TODO: Validate URIs
+
+
+def validate_insert_record_set(record_set: InsertRecordSet) -> None:
+    """
+    Validates the InsertRecordSet, ensuring that all fields are of the right type and length.
+    """
+    _validate_record_set_length_consistency(record_set)
+    validate_base_record_set(record_set)
+
+    validate_ids(record_set["ids"])
+    if record_set["metadatas"] is not None:
+        validate_metadatas(record_set["metadatas"])
+
+
+def _validate_record_set_length_consistency(record_set: BaseRecordSet) -> None:
+    lengths = [len(lst) for lst in record_set.values() if lst is not None]  # type: ignore[arg-type]
+
+    if not lengths:
+        raise ValueError(
+            f"At least one of one of {', '.join(record_set.keys())} must be provided"
+        )
+
+    zero_lengths = [
+        key for key, lst in record_set.items() if lst is not None and len(lst) == 0  # type: ignore[arg-type]
+    ]
+
+    if zero_lengths:
+        raise ValueError(f"Non-empty lists are required for {zero_lengths}")
+
+    if len(set(lengths)) > 1:
+        error_str = ", ".join(
+            f"{key}: {len(lst)}" for key, lst in record_set.items() if lst is not None  # type: ignore[arg-type]
+        )
+        raise ValueError(f"Unequal lengths for fields: {error_str}")
+
+
+def validate_record_set_for_embedding(
+    record_set: BaseRecordSet, embeddable_fields: Optional[Set[str]] = None
+) -> None:
+    """
+    Validates that the Record is ready to be embedded, i.e. that it contains exactly one of the embeddable fields.
+    """
+    if record_set["embeddings"] is not None:
+        raise ValueError("Attempting to embed a record that already has embeddings.")
+    if embeddable_fields is None:
+        embeddable_fields = get_default_embeddable_record_set_fields()
+    validate_record_set_contains_one(record_set, embeddable_fields)
+
+
+def validate_record_set_contains_any(
+    record_set: BaseRecordSet, contains_any: Set[str]
+) -> None:
+    """
+    Validates that at least one of the fields in contains_any is not None.
+    """
+    _validate_record_set_contains(record_set, contains_any)
+
+    if not any(record_set[field] is not None for field in contains_any):  # type: ignore[literal-required]
+        raise ValueError(f"At least one of {', '.join(contains_any)} must be provided")
+
+
+def validate_record_set_contains_one(
+    record_set: BaseRecordSet, contains_one: Set[str]
+) -> None:
+    """
+    Validates that exactly one of the fields in contains_one is not None.
+    """
+    _validate_record_set_contains(record_set, contains_one)
+    if sum(record_set[field] is not None for field in contains_one) != 1:  # type: ignore[literal-required]
+        raise ValueError(f"Exactly one of {', '.join(contains_one)} must be provided")
+
+
+def _validate_record_set_contains(
+    record_set: BaseRecordSet, contains: Set[str]
+) -> None:
+    """
+    Validates that all fields in contains are valid fields of the Record.
+    """
+    if any(field not in record_set for field in contains):
+        raise ValueError(
+            f"Invalid field in contains: {', '.join(contains)}, available fields: {', '.join(record_set.keys())}"
+        )
+
+
+Parameter = TypeVar("Parameter", Document, Image, Embedding, Metadata, ID)
+
+
+class IncludeEnum(str, Enum):
+    documents = "documents"
+    embeddings = "embeddings"
+    metadatas = "metadatas"
+    distances = "distances"
+    uris = "uris"
+    data = "data"
+
+
+# This should ust be List[Literal["documents", "embeddings", "metadatas", "distances"]]
+# However, this provokes an incompatibility with the Overrides library and Python 3.7
+Include = List[IncludeEnum]
+IncludeMetadataDocuments = Field(default=["metadatas", "documents"])
+IncludeMetadataDocumentsEmbeddings = Field(
+    default=["metadatas", "documents", "embeddings"]
+)
+IncludeMetadataDocumentsEmbeddingsDistances = Field(
+    default=["metadatas", "documents", "embeddings", "distances"]
+)
+IncludeMetadataDocumentsDistances = Field(
+    default=["metadatas", "documents", "distances"]
+)
+
+# Re-export types from chromadb.types
+LiteralValue = LiteralValue
+LogicalOperator = LogicalOperator
+WhereOperator = WhereOperator
+OperatorExpression = OperatorExpression
+Where = Where
+WhereDocumentOperator = WhereDocumentOperator
+
+
+class FilterSet(TypedDict):
+    where: Optional[Where]
+    where_document: Optional[WhereDocument]
+
+
+def validate_filter_set(filter_set: FilterSet) -> None:
+    if filter_set["where"] is not None:
+        validate_where(filter_set["where"])
+    if filter_set["where_document"] is not None:
+        validate_where_document(filter_set["where_document"])
+
+
+Embeddable = Union[Documents, Images]
+D = TypeVar("D", bound=Embeddable, contravariant=True)
+
+
+Loadable = List[Optional[Image]]
+L = TypeVar("L", covariant=True, bound=Loadable)
+
+
+class AddRequest(TypedDict):
+    ids: IDs
+    embeddings: Embeddings
+    metadatas: Optional[Metadatas]
+    documents: Optional[Documents]
+    uris: Optional[URIs]
+
+
+# Add result doesn't exist.
+
+
+class GetRequest(TypedDict):
+    ids: Optional[IDs]
+    where: Optional[Where]
+    where_document: Optional[WhereDocument]
+    include: Include
 
 
 class GetResult(TypedDict):
     ids: List[ID]
-    embeddings: Optional[List[Embedding]]
+    embeddings: Optional[
+        Union[Embeddings, PyEmbeddings, NDArray[Union[np.int32, np.float32]]]
+    ]
     documents: Optional[List[Document]]
+    uris: Optional[URIs]
+    data: Optional[Loadable]
     metadatas: Optional[List[Metadata]]
+    included: Include
+
+
+class QueryRequest(TypedDict):
+    embeddings: Embeddings
+    where: Optional[Where]
+    where_document: Optional[WhereDocument]
+    include: Include
+    n_results: int
 
 
 class QueryResult(TypedDict):
     ids: List[IDs]
-    embeddings: Optional[List[List[Embedding]]]
+    embeddings: Optional[
+        Union[
+            List[Embeddings],
+            List[PyEmbeddings],
+            List[NDArray[Union[np.int32, np.float32]]],
+        ]
+    ]
     documents: Optional[List[List[Document]]]
+    uris: Optional[List[List[URI]]]
+    data: Optional[List[Loadable]]
     metadatas: Optional[List[List[Metadata]]]
     distances: Optional[List[List[float]]]
+    included: Include
+
+
+class UpdateRequest(TypedDict):
+    ids: IDs
+    embeddings: Optional[Embeddings]
+    metadatas: Optional[Metadatas]
+    documents: Optional[Documents]
+    uris: Optional[URIs]
+
+
+# Update result doesn't exist.
+
+
+class UpsertRequest(TypedDict):
+    ids: IDs
+    embeddings: Embeddings
+    metadatas: Optional[Metadatas]
+    documents: Optional[Documents]
+    uris: Optional[URIs]
+
+
+# Upsert result doesn't exist.
+
+
+class DeleteRequest(TypedDict):
+    ids: Optional[IDs]
+    where: Optional[Where]
+    where_document: Optional[WhereDocument]
+
+
+# Delete result doesn't exist.
 
 
 class IndexMetadata(TypedDict):
@@ -64,55 +452,132 @@ class IndexMetadata(TypedDict):
     time_created: float
 
 
-class EmbeddingFunction(Protocol):
-    def __call__(self, texts: Documents) -> Embeddings:
+@runtime_checkable
+class EmbeddingFunction(Protocol[D]):
+    def __call__(self, input: D) -> Embeddings:
         ...
 
+    def __init_subclass__(cls) -> None:
+        super().__init_subclass__()
+        # Raise an exception if __call__ is not defined since it is expected to be defined
+        call = getattr(cls, "__call__")
 
-def maybe_cast_one_to_many(
-    target: OneOrMany[Parameter],
-) -> List[Parameter]:
-    """Infers if target is Embedding, Metadata, or Document and casts it to a many object if its one"""
+        def __call__(self: EmbeddingFunction[D], input: D) -> Embeddings:
+            result = call(self, input)
+            assert result is not None
+            return validate_embeddings(cast(Embeddings, normalize_embeddings(result)))
 
-    if isinstance(target, Sequence):
-        # One Document or ID
-        if isinstance(target, str) and target is not None:
-            return [target]
-        # One Embedding
-        if isinstance(target[0], (int, float)):
-            return [target]  # type: ignore
-    # One Metadata dict
-    if isinstance(target, dict):
-        return [target]
-    # Already a sequence
-    return target  # type: ignore
+        setattr(cls, "__call__", __call__)
+
+    def embed_with_retries(
+        self, input: D, **retry_kwargs: Dict[str, Any]
+    ) -> Embeddings:
+        return cast(Embeddings, retry(**retry_kwargs)(self.__call__)(input))
+
+
+def validate_embedding_function(
+    embedding_function: EmbeddingFunction[Embeddable],
+) -> None:
+    function_signature = signature(
+        embedding_function.__class__.__call__
+    ).parameters.keys()
+    protocol_signature = signature(EmbeddingFunction.__call__).parameters.keys()
+
+    if not function_signature == protocol_signature:
+        raise ValueError(
+            f"Expected EmbeddingFunction.__call__ to have the following signature: {protocol_signature}, got {function_signature}\n"
+            "Please see https://docs.trychroma.com/guides/embeddings for details of the EmbeddingFunction interface.\n"
+            "Please note the recent change to the EmbeddingFunction interface: https://docs.trychroma.com/deployment/migration#migration-to-0.4.16---november-7,-2023 \n"
+        )
+
+
+class DataLoader(Protocol[L]):
+    def __call__(self, uris: URIs) -> L:
+        ...
 
 
 def validate_ids(ids: IDs) -> IDs:
     """Validates ids to ensure it is a list of strings"""
     if not isinstance(ids, list):
-        raise ValueError(f"Expected IDs to be a list, got {ids}")
+        raise ValueError(f"Expected IDs to be a list, got {type(ids).__name__} as IDs")
     if len(ids) == 0:
-        raise ValueError(f"Expected IDs to be a non-empty list, got {ids}")
-    for id in ids:
-        if not isinstance(id, str):
-            raise ValueError(f"Expected ID to be a str, got {id}")
-    if len(ids) != len(set(ids)):
-        dups = set([x for x in ids if ids.count(x) > 1])
-        raise errors.DuplicateIDError(
-            f"Expected IDs to be unique, found duplicates for: {dups}"
-        )
+        raise ValueError(f"Expected IDs to be a non-empty list, got {len(ids)} IDs")
+    seen = set()
+    dups = set()
+    for id_ in ids:
+        if not isinstance(id_, str):
+            raise ValueError(f"Expected ID to be a str, got {id_}")
+        if id_ in seen:
+            dups.add(id_)
+        else:
+            seen.add(id_)
+    if dups:
+        n_dups = len(dups)
+        if n_dups < 10:
+            example_string = ", ".join(dups)
+            message = (
+                f"Expected IDs to be unique, found duplicates of: {example_string}"
+            )
+        else:
+            examples = []
+            for idx, dup in enumerate(dups):
+                examples.append(dup)
+                if idx == 10:
+                    break
+            example_string = (
+                f"{', '.join(examples[:5])}, ..., {', '.join(examples[-5:])}"
+            )
+            message = f"Expected IDs to be unique, found {n_dups} duplicated IDs: {example_string}"
+        raise errors.DuplicateIDError(message)
     return ids
 
 
 def validate_metadata(metadata: Metadata) -> Metadata:
-    """Validates metadata to ensure it is a dictionary of strings to strings, ints, or floats"""
-    if not isinstance(metadata, dict):
-        raise ValueError(f"Expected metadata to be a dict, got {metadata}")
+    """Validates metadata to ensure it is a dictionary of strings to strings, ints, floats or bools"""
+    if not isinstance(metadata, dict) and metadata is not None:
+        raise ValueError(
+            f"Expected metadata to be a dict or None, got {type(metadata).__name__} as metadata"
+        )
+    if metadata is None:
+        return metadata
+    if len(metadata) == 0:
+        raise ValueError(
+            f"Expected metadata to be a non-empty dict, got {len(metadata)} metadata attributes"
+        )
+    for key, value in metadata.items():
+        if key == META_KEY_CHROMA_DOCUMENT:
+            raise ValueError(
+                f"Expected metadata to not contain the reserved key {META_KEY_CHROMA_DOCUMENT}"
+            )
+        if not isinstance(key, str):
+            raise TypeError(
+                f"Expected metadata key to be a str, got {key} which is a {type(key).__name__}"
+            )
+        # isinstance(True, int) evaluates to True, so we need to check for bools separately
+        if not isinstance(value, bool) and not isinstance(value, (str, int, float)):
+            raise ValueError(
+                f"Expected metadata value to be a str, int, float or bool, got {value} which is a {type(value).__name__}"
+            )
+    return metadata
+
+
+def validate_update_metadata(metadata: UpdateMetadata) -> UpdateMetadata:
+    """Validates metadata to ensure it is a dictionary of strings to strings, ints, floats or bools"""
+    if not isinstance(metadata, dict) and metadata is not None:
+        raise ValueError(
+            f"Expected metadata to be a dict or None, got {type(metadata)}"
+        )
+    if metadata is None:
+        return metadata
+    if len(metadata) == 0:
+        raise ValueError(f"Expected metadata to be a non-empty dict, got {metadata}")
     for key, value in metadata.items():
         if not isinstance(key, str):
             raise ValueError(f"Expected metadata key to be a str, got {key}")
-        if not isinstance(value, (str, int, float)):
+        # isinstance(True, int) evaluates to True, so we need to check for bools separately
+        if not isinstance(value, bool) and not isinstance(
+            value, (str, int, float, type(None))
+        ):
             raise ValueError(
                 f"Expected metadata value to be a str, int, or float, got {value}"
             )
@@ -120,7 +585,7 @@ def validate_metadata(metadata: Metadata) -> Metadata:
 
 
 def validate_metadatas(metadatas: Metadatas) -> Metadatas:
-    """Validates metadatas to ensure it is a list of dictionaries of strings to strings, ints, or floats"""
+    """Validates metadatas to ensure it is a list of dictionaries of strings to strings, ints, floats or bools"""
     if not isinstance(metadatas, list):
         raise ValueError(f"Expected metadatas to be a list, got {metadatas}")
     for metadata in metadatas:
@@ -128,19 +593,23 @@ def validate_metadatas(metadatas: Metadatas) -> Metadatas:
     return metadatas
 
 
-def validate_where(where: Where) -> Where:
+def validate_where(where: Where) -> None:
     """
     Validates where to ensure it is a dictionary of strings to strings, ints, floats or operator expressions,
     or in the case of $and and $or, a list of where expressions
     """
     if not isinstance(where, dict):
         raise ValueError(f"Expected where to be a dict, got {where}")
+    if len(where) != 1:
+        raise ValueError(f"Expected where to have exactly one operator, got {where}")
     for key, value in where.items():
         if not isinstance(key, str):
             raise ValueError(f"Expected where key to be a str, got {key}")
         if (
             key != "$and"
             and key != "$or"
+            and key != "$in"
+            and key != "$nin"
             and not isinstance(value, (str, int, float, dict))
         ):
             raise ValueError(
@@ -172,20 +641,41 @@ def validate_where(where: Where) -> Where:
                         raise ValueError(
                             f"Expected operand value to be an int or a float for operator {operator}, got {operand}"
                         )
-
-                if operator not in ["$gt", "$gte", "$lt", "$lte", "$ne", "$eq"]:
+                if operator in ["$in", "$nin"]:
+                    if not isinstance(operand, list):
+                        raise ValueError(
+                            f"Expected operand value to be an list for operator {operator}, got {operand}"
+                        )
+                if operator not in [
+                    "$gt",
+                    "$gte",
+                    "$lt",
+                    "$lte",
+                    "$ne",
+                    "$eq",
+                    "$in",
+                    "$nin",
+                ]:
                     raise ValueError(
-                        f"Expected where operator to be one of $gt, $gte, $lt, $lte, $ne, $eq, got {operator}"
+                        f"Expected where operator to be one of $gt, $gte, $lt, $lte, $ne, $eq, $in, $nin, "
+                        f"got {operator}"
                     )
 
-                if not isinstance(operand, (str, int, float)):
+                if not isinstance(operand, (str, int, float, list)):
                     raise ValueError(
-                        f"Expected where operand value to be a str, int, or float, got {operand}"
+                        f"Expected where operand value to be a str, int, float, or list of those type, got {operand}"
                     )
-    return where
+                if isinstance(operand, list) and (
+                    len(operand) == 0
+                    or not all(isinstance(x, type(operand[0])) for x in operand)
+                ):
+                    raise ValueError(
+                        f"Expected where operand value to be a non-empty list, and all values to be of the same type "
+                        f"got {operand}"
+                    )
 
 
-def validate_where_document(where_document: WhereDocument) -> WhereDocument:
+def validate_where_document(where_document: WhereDocument) -> None:
     """
     Validates where_document to ensure it is a dictionary of WhereDocumentOperator to strings, or in the case of $and and $or,
     a list of where_document expressions
@@ -199,7 +689,7 @@ def validate_where_document(where_document: WhereDocument) -> WhereDocument:
             f"Expected where document to have exactly one operator, got {where_document}"
         )
     for operator, operand in where_document.items():
-        if operator not in ["$contains", "$and", "$or"]:
+        if operator not in ["$contains", "$not_contains", "$and", "$or"]:
             raise ValueError(
                 f"Expected where document operator to be one of $contains, $and, $or, got {operator}"
             )
@@ -219,10 +709,13 @@ def validate_where_document(where_document: WhereDocument) -> WhereDocument:
             raise ValueError(
                 f"Expected where document operand value for operator $contains to be a str, got {operand}"
             )
-    return where_document
+        elif len(operand) == 0:
+            raise ValueError(
+                "Expected where document operand value for operator $contains to be a non-empty str"
+            )
 
 
-def validate_include(include: Include, allow_distances: bool) -> Include:
+def validate_include(include: Include, dissalowed: Optional[Include] = None) -> None:
     """Validates include to ensure it is a list of strings. Since get does not allow distances, allow_distances is used
     to control if distances is allowed"""
 
@@ -231,14 +724,16 @@ def validate_include(include: Include, allow_distances: bool) -> Include:
     for item in include:
         if not isinstance(item, str):
             raise ValueError(f"Expected include item to be a str, got {item}")
-        allowed_values = ["embeddings", "documents", "metadatas"]
-        if allow_distances:
-            allowed_values.append("distances")
-        if item not in allowed_values:
+
+        if not any(item == e for e in IncludeEnum):
             raise ValueError(
-                f"Expected include item to be one of {', '.join(allowed_values)}, got {item}"
+                f"Expected include item to be one of {', '.join(IncludeEnum)}, got {item}"
             )
-    return include
+
+        if dissalowed is not None and any(item == e for e in dissalowed):
+            raise ValueError(
+                f"Include item cannot be one of {', '.join(dissalowed)}, got {item}"
+            )
 
 
 def validate_n_results(n_results: int) -> int:
@@ -256,20 +751,93 @@ def validate_n_results(n_results: int) -> int:
 
 
 def validate_embeddings(embeddings: Embeddings) -> Embeddings:
-    """Validates embeddings to ensure it is a list of list of ints, or floats"""
-    if not isinstance(embeddings, list):
-        raise ValueError(f"Expected embeddings to be a list, got {embeddings}")
+    """Validates embeddings to ensure it is a list of numpy arrays of ints, or floats"""
+    if not isinstance(embeddings, (list, np.ndarray)):
+        raise ValueError(
+            f"Expected embeddings to be a list, got {type(embeddings).__name__}"
+        )
     if len(embeddings) == 0:
         raise ValueError(
-            f"Expected embeddings to be a list with at least one item, got {embeddings}"
+            f"Expected embeddings to be a list with at least one item, got {len(embeddings)} embeddings"
         )
-    if not all([isinstance(e, list) for e in embeddings]):
+    if not all([isinstance(e, np.ndarray) for e in embeddings]):
         raise ValueError(
-            f"Expected each embedding in the embeddings to be a list, got {embeddings}"
+            "Expected each embedding in the embeddings to be a numpy array, got "
+            f"{list(set([type(e).__name__ for e in embeddings]))}"
         )
-    for embedding in embeddings:
-        if not all([isinstance(value, (int, float)) for value in embedding]):
+    for i, embedding in enumerate(embeddings):
+        if embedding.ndim == 0:
             raise ValueError(
-                f"Expected each value in the embedding to be a int or float, got {embeddings}"
+                f"Expected a 1-dimensional array, got a 0-dimensional array {embedding}"
+            )
+        if embedding.size == 0:
+            raise ValueError(
+                f"Expected each embedding in the embeddings to be a 1-dimensional numpy array with at least 1 int/float value. Got a 1-dimensional numpy array with no values at pos {i}"
+            )
+        if not all(
+            [
+                isinstance(value, (np.integer, float, np.floating))
+                and not isinstance(value, bool)
+                for value in embedding
+            ]
+        ):
+            raise ValueError(
+                "Expected each value in the embedding to be a int or float, got an embedding with "
+                f"{list(set([type(value).__name__ for value in embedding]))} - {embedding}"
             )
     return embeddings
+
+
+def validate_documents(documents: Documents, nullable: bool = False) -> None:
+    """Validates documents to ensure it is a list of strings"""
+    if not isinstance(documents, list):
+        raise ValueError(
+            f"Expected documents to be a list, got {type(documents).__name__}"
+        )
+    if len(documents) == 0:
+        raise ValueError(
+            f"Expected documents to be a non-empty list, got {len(documents)} documents"
+        )
+    for document in documents:
+        # If embeddings are present, some documents can be None
+        if document is None and nullable:
+            continue
+        if not is_document(document):
+            raise ValueError(f"Expected document to be a str, got {document}")
+
+
+def validate_images(images: Images) -> None:
+    """Validates images to ensure it is a list of numpy arrays"""
+    if not isinstance(images, list):
+        raise ValueError(f"Expected images to be a list, got {type(images).__name__}")
+    if len(images) == 0:
+        raise ValueError(
+            f"Expected images to be a non-empty list, got {len(images)} images"
+        )
+    for image in images:
+        if not is_image(image):
+            raise ValueError(f"Expected image to be a numpy array, got {image}")
+
+
+def validate_batch(
+    batch: Tuple[
+        IDs,
+        Optional[Union[Embeddings, PyEmbeddings]],
+        Optional[Metadatas],
+        Optional[Documents],
+        Optional[URIs],
+    ],
+    limits: Dict[str, Any],
+) -> None:
+    if len(batch[0]) > limits["max_batch_size"]:
+        raise ValueError(
+            f"Batch size {len(batch[0])} exceeds maximum batch size {limits['max_batch_size']}"
+        )
+
+
+def convert_np_embeddings_to_list(embeddings: Embeddings) -> PyEmbeddings:
+    return [embedding.tolist() for embedding in embeddings]
+
+
+def convert_list_embeddings_to_np(embeddings: PyEmbeddings) -> Embeddings:
+    return [np.array(embedding) for embedding in embeddings]

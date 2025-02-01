@@ -1,14 +1,21 @@
+import sys
 from typing import Sequence
-from typing_extensions import TypedDict
-import os
+from typing_extensions import TypedDict, NotRequired
+from importlib_resources.abc import Traversable
 import re
 import hashlib
 from chromadb.db.base import SqlDB, Cursor
 from abc import abstractmethod
 from chromadb.config import System, Settings
+from chromadb.telemetry.opentelemetry import (
+    OpenTelemetryClient,
+    OpenTelemetryGranularity,
+    trace_method,
+)
 
 
 class MigrationFile(TypedDict):
+    path: NotRequired[Traversable]
     dir: str
     filename: str
     version: int
@@ -46,10 +53,15 @@ class InconsistentVersionError(Exception):
 class InconsistentHashError(Exception):
     def __init__(self, path: str, db_hash: str, source_hash: str):
         super().__init__(
-            f"Inconsistent MD5 hashes in {path}:"
+            f"Inconsistent hashes in {path}:"
             + f"db hash was {db_hash}, source has was {source_hash}."
             + " Was the migration file modified after being applied to the DB?"
         )
+
+
+class InvalidHashError(Exception):
+    def __init__(self, alg: str):
+        super().__init__(f"Invalid hash algorithm specified: {alg}")
 
 
 class InvalidMigrationFilename(Exception):
@@ -59,9 +71,12 @@ class InvalidMigrationFilename(Exception):
 class MigratableDB(SqlDB):
     """Simple base class for databases which support basic migrations.
 
-    Migrations are SQL files stored in a project-relative directory. All migrations in
-    the same directory are assumed to be dependent on previous migrations in the same
-    directory, where "previous" is defined on lexographical ordering of filenames.
+    Migrations are SQL files stored as package resources and accessed via
+    importlib_resources.
+
+    All migrations in the same directory are assumed to be dependent on previous
+    migrations in the same directory, where "previous" is defined on lexographical
+    ordering of filenames.
 
     Migrations have a ascending numeric version number and a hash of the file contents.
     When migrations are applied, the hashes of previous migrations are checked to ensure
@@ -78,7 +93,8 @@ class MigratableDB(SqlDB):
 
     def __init__(self, system: System) -> None:
         self._settings = system.settings
-        super().__init__()
+        self._opentelemetry_client = system.require(OpenTelemetryClient)
+        super().__init__(system)
 
     @staticmethod
     @abstractmethod
@@ -87,7 +103,7 @@ class MigratableDB(SqlDB):
         pass
 
     @abstractmethod
-    def migration_dirs(self) -> Sequence[str]:
+    def migration_dirs(self) -> Sequence[Traversable]:
         """Directories containing the migration sequences that should be applied to this
         DB."""
         pass
@@ -103,7 +119,7 @@ class MigratableDB(SqlDB):
         pass
 
     @abstractmethod
-    def db_migrations(self, dir: str) -> Sequence[Migration]:
+    def db_migrations(self, dir: Traversable) -> Sequence[Migration]:
         """Return a list of all migrations already applied to this database, from the
         given source directory, in ascending order."""
         pass
@@ -123,6 +139,7 @@ class MigratableDB(SqlDB):
         if migrate == "apply":
             self.apply_migrations()
 
+    @trace_method("MigratableDB.validate_migrations", OpenTelemetryGranularity.ALL)
     def validate_migrations(self) -> None:
         """Validate all migrations and throw an exception if there are any unapplied
         migrations in the source repo."""
@@ -130,20 +147,29 @@ class MigratableDB(SqlDB):
             raise UninitializedMigrationsError()
         for dir in self.migration_dirs():
             db_migrations = self.db_migrations(dir)
-            source_migrations = find_migrations(dir, self.migration_scope())
+            source_migrations = find_migrations(
+                dir,
+                self.migration_scope(),
+                self._settings.require("migrations_hash_algorithm"),
+            )
             unapplied_migrations = verify_migration_sequence(
                 db_migrations, source_migrations
             )
             if len(unapplied_migrations) > 0:
                 version = unapplied_migrations[0]["version"]
-                raise UnappliedMigrationsError(dir=dir, version=version)
+                raise UnappliedMigrationsError(dir=dir.name, version=version)
 
+    @trace_method("MigratableDB.apply_migrations", OpenTelemetryGranularity.ALL)
     def apply_migrations(self) -> None:
         """Validate existing migrations, and apply all new ones."""
         self.setup_migrations()
         for dir in self.migration_dirs():
             db_migrations = self.db_migrations(dir)
-            source_migrations = find_migrations(dir, self.migration_scope())
+            source_migrations = find_migrations(
+                dir,
+                self.migration_scope(),
+                self._settings.require("migrations_hash_algorithm"),
+            )
             unapplied_migrations = verify_migration_sequence(
                 db_migrations, source_migrations
             )
@@ -157,13 +183,16 @@ class MigratableDB(SqlDB):
 filename_regex = re.compile(r"(\d+)-(.+)\.(.+)\.sql")
 
 
-def _parse_migration_filename(dir: str, filename: str) -> MigrationFile:
+def _parse_migration_filename(
+    dir: str, filename: str, path: Traversable
+) -> MigrationFile:
     """Parse a migration filename into a MigrationFile object"""
     match = filename_regex.match(filename)
     if match is None:
         raise InvalidMigrationFilename("Invalid migration filename: " + filename)
     version, _, scope = match.groups()
     return {
+        "path": path,
         "dir": dir,
         "filename": filename,
         "version": int(version),
@@ -203,23 +232,40 @@ def verify_migration_sequence(
     return source_migrations[len(db_migrations) :]
 
 
-def find_migrations(dir: str, scope: str) -> Sequence[Migration]:
+def find_migrations(
+    dir: Traversable, scope: str, hash_alg: str = "md5"
+) -> Sequence[Migration]:
     """Return a list of all migration present in the given directory, in ascending
     order. Filter by scope."""
     files = [
-        _parse_migration_filename(dir, filename)
-        for filename in os.listdir(dir)
-        if filename.endswith(".sql")
+        _parse_migration_filename(dir.name, t.name, t)
+        for t in dir.iterdir()
+        if t.name.endswith(".sql")
     ]
     files = list(filter(lambda f: f["scope"] == scope, files))
     files = sorted(files, key=lambda f: f["version"])
-    return [_read_migration_file(f) for f in files]
+    return [_read_migration_file(f, hash_alg) for f in files]
 
 
-def _read_migration_file(file: MigrationFile) -> Migration:
+def _read_migration_file(file: MigrationFile, hash_alg: str) -> Migration:
     """Read a migration file"""
-    sql = open(os.path.join(file["dir"], file["filename"])).read()
-    hash = hashlib.md5(sql.encode("utf-8")).hexdigest()
+    if "path" not in file or not file["path"].is_file():
+        raise FileNotFoundError(
+            f"No migration file found for dir {file['dir']} with filename {file['filename']} and scope {file['scope']} at version {file['version']}"
+        )
+    sql = file["path"].read_text()
+
+    if hash_alg == "md5":
+        hash = (
+            hashlib.md5(sql.encode("utf-8"), usedforsecurity=False).hexdigest()
+            if sys.version_info >= (3, 9)
+            else hashlib.md5(sql.encode("utf-8")).hexdigest()
+        )
+    elif hash_alg == "sha256":
+        hash = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+    else:
+        raise InvalidHashError(alg=hash_alg)
+
     return {
         "hash": hash,
         "sql": sql,

@@ -6,8 +6,6 @@ https://packaging.python.org.
 
 ## Setup
 
-Because of the dependencies it relies on (like `pytorch`), this project does not support Python version >3.10.0.
-
 Set up a virtual environment and install the project's requirements
 and dev requirements:
 
@@ -36,25 +34,29 @@ print(api.heartbeat())
 This by default saves your db and your indexes to a `.chroma` directory and can also load from them.
 ```python
 import chromadb
-from chromadb.config import Settings
-api = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet",
-                      persist_directory="/path/to/persist/directory"))
+api = chromadb.PersistentClient(path="/path/to/persist/directory")
 print(api.heartbeat())
 ```
 
 
 3. With a persistent backend and a small frontend client
 
-Run `docker-compose up -d --build`
+Run `chroma run --path /chroma_db_path`
 ```python
 import chromadb
-from chromadb.config import Settings
-api = chromadb.Client(Settings(chroma_api_impl="rest",
-                              chroma_server_host="localhost",
-                              chroma_server_http_port="8000") )
+api = chromadb.HttpClient(host="localhost", port="8000")
 
 print(api.heartbeat())
 ```
+## Local dev setup for distributed chroma
+We use tilt for providing local dev setup. Tilt is an open source project
+##### Requirement
+- Docker
+- Local Kubernetes cluster (Recommended: [OrbStack](https://orbstack.dev/) for mac, [Kind](https://kind.sigs.k8s.io/) for linux)
+- [Tilt](https://docs.tilt.dev/)
+
+For starting the distributed Chroma in the workspace, use `tilt up`. It will create all the required resources and build the necessary Docker image in the current kubectl context.
+Once done, it will expose Chroma on port 8000. You can also visit the Tilt dashboard UI at http://localhost:10350/. To clean and remove all the resources created by Tilt, use `tilt down`.
 
 ## Testing
 
@@ -84,7 +86,7 @@ In brief, version numbers are generated as follows:
 
 - If the current git head is tagged, the version number is exactly the
   tag (e.g, `0.0.1`).
-- If the the current git head is a clean checkout, but is not tagged,
+- If the current git head is a clean checkout, but is not tagged,
   the version number is a patch version increment of the most recent
   tag, plus `devN` where N is the number of commits since the most
   recent tag. For example, if there have been 5 commits since the

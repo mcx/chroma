@@ -4,7 +4,7 @@
 
 <p align="center">
     <b>Chroma - the open-source embedding database</b>. <br />
-    This package is for the the Python HTTP client-only library for Chroma. This client connects to the Chroma Server. If that it not what you are looking for, you might want to check out the <a href="https://github.com/chroma-core/chroma ">full library</a>.
+    This package is for the Python HTTP client-only library for Chroma. This client connects to the Chroma Server. If that it not what you are looking for, you might want to check out the <a href="https://github.com/chroma-core/chroma ">full library</a>.
 </p>
 
 
@@ -16,11 +16,8 @@ To connect to your server and perform operations using the client only library, 
 
 ```python
 import chromadb
-from chromadb.config import Settings
 # Example setup of the client to connect to your chroma server
-client = chromadb.Client(Settings(chroma_api_impl="rest",
-                                  chroma_server_host="localhost",
-                                  chroma_server_port=8000))
+client = chromadb.HttpClient(host="localhost", port=8000)
 
 collection = client.create_collection("all-my-documents")
 
